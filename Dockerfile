@@ -1,12 +1,13 @@
 FROM alpine:latest
 
-# Install Python and networking tools
+# Install Python + networking tools
 RUN apk add --no-cache python3 iproute2
 
-# Copy router code
+# Copy file
 COPY router.py /app/router.py
 
 WORKDIR /app
 
-# Run router
-CMD ["python3", "router.py"]
+ENV PYTHONUNBUFFERED=1
+
+CMD ["python3", "-u", "router.py"]
