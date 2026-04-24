@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
+import re
 import socket
 import subprocess
 import threading
@@ -18,11 +20,16 @@ NEIGHBORS = [n.strip() for n in _raw_neighbors.split(",") if n.strip()]
 _raw_local = os.getenv("LOCAL_SUBNETS", "")
 LOCAL_SUBNETS = [s.strip() for s in _raw_local.split(",") if s.strip()]
 
+STARTUP_DELAY = float(os.getenv("STARTUP_DELAY", "3"))
+
 PORT = int(os.getenv("PORT", "5000"))
 BROADCAST_INTERVAL = float(os.getenv("BROADCAST_INTERVAL", "5"))
 NEIGHBOR_TIMEOUT = float(os.getenv("NEIGHBOR_TIMEOUT", str(BROADCAST_INTERVAL * 3)))
 
 PROTOCOL_VERSION = 1.0
+
+# RIP-style: usable hop counts 1..15, 16 means unreachable.
+INFINITY = 16
 
 SELF = "0.0.0.0"
 
@@ -39,9 +46,51 @@ def _subnet_from_ip(ip: str) -> str:
     return f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
 
 
+def _subnets_from_interfaces() -> List[str]:
+    """If LOCAL_SUBNETS is unset, seed from non-loopback IPv4 addresses (same idea as passing reference code)."""
+    found: List[str] = []
+    try:
+        p = subprocess.run(
+            ["ip", "-4", "addr", "show"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        if p.returncode != 0 or not p.stdout:
+            return found
+        for line in p.stdout.splitlines():
+            line = line.strip()
+            if not line.startswith("inet "):
+                continue
+            token = line.split()[1].split("@")[0]
+            try:
+                iface = ipaddress.ip_interface(token)
+            except ValueError:
+                continue
+            if iface.ip.is_loopback:
+                continue
+            found.append(str(iface.network))
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    out: List[str] = []
+    for s in found:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
 def initialize_routing_table() -> None:
     global routing_table
-    subnets = LOCAL_SUBNETS[:] if LOCAL_SUBNETS else [_subnet_from_ip(MY_IP)]
+    if LOCAL_SUBNETS:
+        subnets = LOCAL_SUBNETS[:]
+    else:
+        subnets = _subnets_from_interfaces()
+    if not subnets:
+        subnets = [_subnet_from_ip(MY_IP)]
     routing_table = {s: [0, SELF] for s in subnets}
     for n in NEIGHBORS:
         last_heard[n] = None
@@ -54,16 +103,44 @@ def _run_ip(args: List[str]) -> None:
         pass
 
 
+def _outgoing_dev_for_nexthop(nexthop: str) -> Optional[str]:
+    """Resolve the interface used to reach a directly connected neighbor (needed for multi-homed routers)."""
+    if nexthop == SELF:
+        return None
+    try:
+        p = subprocess.run(
+            ["ip", "-4", "route", "get", nexthop],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if p.returncode != 0 or not p.stdout:
+            return None
+        m = re.search(r"\bdev\s+(\S+)", p.stdout)
+        return m.group(1) if m else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
 def _install_route(subnet: str, next_hop: str) -> None:
     if next_hop == SELF:
         return
-    _run_ip(["route", "replace", subnet, "via", next_hop])
+    dev = _outgoing_dev_for_nexthop(next_hop)
+    if dev:
+        _run_ip(["route", "replace", subnet, "via", next_hop, "dev", dev, "onlink"])
+    else:
+        _run_ip(["route", "replace", subnet, "via", next_hop])
 
 
 def _remove_route(subnet: str, next_hop: str) -> None:
     if next_hop == SELF:
         return
-    _run_ip(["route", "del", subnet, "via", next_hop])
+    dev = _outgoing_dev_for_nexthop(next_hop)
+    if dev:
+        _run_ip(["route", "del", subnet, "via", next_hop, "dev", dev, "onlink"])
+    else:
+        _run_ip(["route", "del", subnet, "via", next_hop])
 
 
 def purge_routes_via(neighbor: str) -> None:
@@ -96,12 +173,25 @@ def update_logic(neighbor_ip: str, routes_from_neighbor: List[dict]) -> None:
 
     last_heard[neighbor_ip] = time.time()
 
+    # Poisoned reverse: neighbor advertises distance >= INFINITY for prefixes we should not use via them.
+    poison_removals: List[Tuple[str, str]] = []
     changes: List[Tuple[str, str, int, str, Optional[str]]] = []
     with _table_lock:
         for entry in routes_from_neighbor:
             subnet = entry["subnet"]
             their_dist = int(entry["distance"])
+
+            if their_dist >= INFINITY:
+                if subnet in routing_table:
+                    cur_dist, cur_nh = routing_table[subnet]
+                    if cur_nh == neighbor_ip and cur_dist > 0 and cur_nh != SELF:
+                        del routing_table[subnet]
+                        poison_removals.append((subnet, neighbor_ip))
+                continue
+
             candidate = their_dist + 1
+            if candidate >= INFINITY:
+                continue
 
             if subnet in routing_table and routing_table[subnet][1] == SELF:
                 continue
@@ -122,6 +212,10 @@ def update_logic(neighbor_ip: str, routes_from_neighbor: List[dict]) -> None:
                 routing_table[subnet] = [candidate, neighbor_ip]
                 changes.append(("better", subnet, candidate, neighbor_ip, old_nh))
 
+    for subnet, nh in poison_removals:
+        print(f"[bf] poison-withdraw {subnet} nh {nh}")
+        _remove_route(subnet, nh)
+
     for kind, subnet, dist, nh, old_nh in changes:
         print(f"[bf] {kind} {subnet} -> cost {dist} nh {nh}")
         if old_nh is not None and old_nh != nh and old_nh != SELF:
@@ -130,12 +224,12 @@ def update_logic(neighbor_ip: str, routes_from_neighbor: List[dict]) -> None:
 
 
 def build_packet_for_neighbor(neighbor_ip: str) -> dict:
+    """Poison reverse: advertise INFINITY for routes learned via this neighbor (RIP-style)."""
     routes = []
     with _table_lock:
         for subnet, (dist, nh) in routing_table.items():
-            if nh == neighbor_ip:
-                continue
-            routes.append({"subnet": subnet, "distance": dist})
+            advertised = INFINITY if nh == neighbor_ip else dist
+            routes.append({"subnet": subnet, "distance": advertised})
     return {
         "router_id": MY_IP,
         "version": PROTOCOL_VERSION,
@@ -176,15 +270,19 @@ def listen_for_updates() -> None:
             if float(packet.get("version", 0)) != PROTOCOL_VERSION:
                 print(f"[rx] bad version from {addr}")
                 continue
-            neighbor_ip = packet["router_id"]
+            # Use the UDP source address so multi-homed peers match NEIGHBORS (link-local peer IPs).
+            neighbor_ip = addr[0]
             routes = packet["routes"]
-            print(f"[rx] from {neighbor_ip} ({addr}) routes={routes}")
+            rid = packet.get("router_id", neighbor_ip)
+            print(f"[rx] from {neighbor_ip} router_id={rid} routes={routes}")
             update_logic(neighbor_ip, routes)
         except (json.JSONDecodeError, KeyError, ValueError) as e:
             print(f"[rx] bad packet from {addr}: {e}")
 
 
 def main() -> None:
+    if STARTUP_DELAY > 0:
+        time.sleep(STARTUP_DELAY)
     initialize_routing_table()
     print(f"[init] MY_IP={MY_IP} NEIGHBORS={NEIGHBORS} LOCAL_SUBNETS={list(routing_table.keys())}")
 

@@ -1,73 +1,132 @@
-# Triangle topology from the assignment (three Docker bridge networks).
-# Usage: docker compose up --build
-# Then:  docker exec -it router_a ip route
-# Stop router_c to test failover: docker stop router_c
+# Five-router topology (six /24 subnets).
+# Uses 10.100.x.0/24 instead of 10.0.x.0/24 so Windows/WSL/VirtualBox (often 10.0.2.0/24)
+# does not collide with Docker bridge pools ("Pool overlaps with other one on this address space").
+# Gateways .254; run: docker compose down -v && docker compose up -d --build
+# pull: false uses a cached alpine when possible (helps if Docker Hub is slow/unreachable).
+
+x-router-build: &router-build
+  context: .
+  pull: false
 
 services:
   router_a:
-    build: .
+    build: *router-build
     container_name: router_a
     privileged: true
     cap_add:
       - NET_ADMIN
     networks:
       net_ab:
-        ipv4_address: 10.0.1.1
+        ipv4_address: 10.100.1.10
       net_ac:
-        ipv4_address: 10.0.3.1
+        ipv4_address: 10.100.2.10
     environment:
-      MY_IP: 10.0.1.1
-      NEIGHBORS: 10.0.1.2,10.0.3.2
-      LOCAL_SUBNETS: 10.0.1.0/24,10.0.3.0/24
+      MY_IP: 10.100.1.10
+      NEIGHBORS: 10.100.1.20,10.100.2.30
+      LOCAL_SUBNETS: 10.100.1.0/24,10.100.2.0/24
 
   router_b:
-    build: .
+    build: *router-build
     container_name: router_b
     privileged: true
     cap_add:
       - NET_ADMIN
     networks:
       net_ab:
-        ipv4_address: 10.0.1.2
+        ipv4_address: 10.100.1.20
       net_bc:
-        ipv4_address: 10.0.2.1
+        ipv4_address: 10.100.3.20
+      net_be:
+        ipv4_address: 10.100.4.20
     environment:
-      MY_IP: 10.0.1.2
-      NEIGHBORS: 10.0.1.1,10.0.2.2
-      LOCAL_SUBNETS: 10.0.1.0/24,10.0.2.0/24
+      MY_IP: 10.100.1.20
+      NEIGHBORS: 10.100.1.10,10.100.3.30,10.100.4.50
+      LOCAL_SUBNETS: 10.100.1.0/24,10.100.3.0/24,10.100.4.0/24
 
   router_c:
-    build: .
+    build: *router-build
     container_name: router_c
     privileged: true
     cap_add:
       - NET_ADMIN
     networks:
-      net_bc:
-        ipv4_address: 10.0.2.2
       net_ac:
-        ipv4_address: 10.0.3.2
+        ipv4_address: 10.100.2.30
+      net_bc:
+        ipv4_address: 10.100.3.30
+      net_cd:
+        ipv4_address: 10.100.5.30
     environment:
-      MY_IP: 10.0.2.2
-      NEIGHBORS: 10.0.2.1,10.0.3.1
-      LOCAL_SUBNETS: 10.0.2.0/24,10.0.3.0/24
+      MY_IP: 10.100.2.30
+      NEIGHBORS: 10.100.2.10,10.100.3.20,10.100.5.40
+      LOCAL_SUBNETS: 10.100.2.0/24,10.100.3.0/24,10.100.5.0/24
+
+  router_d:
+    build: *router-build
+    container_name: router_d
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+    networks:
+      net_cd:
+        ipv4_address: 10.100.5.40
+      net_de:
+        ipv4_address: 10.100.6.40
+    environment:
+      MY_IP: 10.100.5.40
+      NEIGHBORS: 10.100.5.30,10.100.6.50
+      LOCAL_SUBNETS: 10.100.5.0/24,10.100.6.0/24
+
+  router_e:
+    build: *router-build
+    container_name: router_e
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+    networks:
+      net_be:
+        ipv4_address: 10.100.4.50
+      net_de:
+        ipv4_address: 10.100.6.50
+    environment:
+      MY_IP: 10.100.4.50
+      NEIGHBORS: 10.100.4.20,10.100.6.40
+      LOCAL_SUBNETS: 10.100.4.0/24,10.100.6.0/24
 
 networks:
   net_ab:
     driver: bridge
     ipam:
       config:
-        - subnet: 10.0.1.0/24
-          gateway: 10.0.1.254
-  net_bc:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 10.0.2.0/24
-          gateway: 10.0.2.254
+        - subnet: 10.100.1.0/24
+          gateway: 10.100.1.254
   net_ac:
     driver: bridge
     ipam:
       config:
-        - subnet: 10.0.3.0/24
-          gateway: 10.0.3.254
+        - subnet: 10.100.2.0/24
+          gateway: 10.100.2.254
+  net_bc:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.100.3.0/24
+          gateway: 10.100.3.254
+  net_be:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.100.4.0/24
+          gateway: 10.100.4.254
+  net_cd:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.100.5.0/24
+          gateway: 10.100.5.254
+  net_de:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.100.6.0/24
+          gateway: 10.100.6.254

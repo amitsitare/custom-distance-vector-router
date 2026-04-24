@@ -1,9 +1,7 @@
-FROM alpine:latest
+FROM alpine:3.20
 
-# Install Python + networking tools
 RUN apk add --no-cache python3 iproute2
 
-# Copy file
 COPY router.py /app/router.py
 
 WORKDIR /app
