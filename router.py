@@ -38,6 +38,9 @@ _table_lock = threading.Lock()
 
 last_heard: Dict[str, Optional[float]] = {}
 
+# Skip aggressive nexthop purges during early bring-up (routes may not exist yet).
+_router_start: float = 0.0
+
 
 def _subnet_from_ip(ip: str) -> str:
     parts = ip.split(".")
@@ -143,6 +146,39 @@ def _remove_route(subnet: str, next_hop: str) -> None:
         _run_ip(["route", "del", subnet, "via", next_hop])
 
 
+def refresh_direct_subnets() -> None:
+    """If an interface goes away (e.g. docker network disconnect), drop SELF/direct rows so DV can relearn."""
+    present = set(_subnets_from_interfaces())
+    if not present:
+        return
+    removed: List[str] = []
+    with _table_lock:
+        for subnet, (dist, nh) in list(routing_table.items()):
+            if nh == SELF and dist == 0 and subnet not in present:
+                del routing_table[subnet]
+                removed.append(subnet)
+    for subnet in removed:
+        print(f"[direct] lost local interface for {subnet}; relearn via neighbors")
+
+
+def purge_unreachable_nexthops(now: float) -> None:
+    """Drop installed routes whose nexthop is no longer reachable (stale after link loss)."""
+    if now - _router_start < 12.0:
+        return
+    with _table_lock:
+        snapshot = [(s, d, nh) for s, (d, nh) in routing_table.items() if nh != SELF and d > 0 and nh in NEIGHBORS]
+    to_drop: List[Tuple[str, str]] = []
+    for subnet, _dist, nh in snapshot:
+        if _outgoing_dev_for_nexthop(nh) is None:
+            to_drop.append((subnet, nh))
+    for subnet, nh in to_drop:
+        with _table_lock:
+            if subnet in routing_table and routing_table[subnet][1] == nh:
+                del routing_table[subnet]
+        print(f"[nh] drop {subnet} via {nh} (nexthop unreachable)")
+        _remove_route(subnet, nh)
+
+
 def purge_routes_via(neighbor: str) -> None:
     to_delete = []
     with _table_lock:
@@ -242,6 +278,8 @@ def broadcast_updates() -> None:
     while True:
         now = time.time()
         check_neighbor_timeouts(now)
+        refresh_direct_subnets()
+        purge_unreachable_nexthops(now)
 
         for neighbor in NEIGHBORS:
             packet = build_packet_for_neighbor(neighbor)
@@ -281,9 +319,11 @@ def listen_for_updates() -> None:
 
 
 def main() -> None:
+    global _router_start
     if STARTUP_DELAY > 0:
         time.sleep(STARTUP_DELAY)
     initialize_routing_table()
+    _router_start = time.time()
     print(f"[init] MY_IP={MY_IP} NEIGHBORS={NEIGHBORS} LOCAL_SUBNETS={list(routing_table.keys())}")
 
     threading.Thread(target=broadcast_updates, daemon=True).start()

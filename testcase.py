@@ -12,7 +12,7 @@ ROUTERS_TRIANGLE = ("router_a", "router_b", "router_c")
 ROUTERS_RING5 = ("router_a", "router_b", "router_c", "router_d", "router_e")
 # Six lab subnets (must match docker-compose.yml; 10.100.x avoids Windows 10.0.2.0/24 clashes).
 SUBNETS_RING5 = tuple(f"10.100.{i}.0/24" for i in range(1, 7))
-LOG_MARKERS = ("[init]", "[tx]", "[rx]", "[bf]", "[warn]", "[send]", "[purge]", "[timeout]")
+LOG_MARKERS = ("[init]", "[tx]", "[rx]", "[bf]", "[warn]", "[send]", "[purge]", "[timeout]", "[direct]", "[nh]")
 
 _compose_cmd_cache: Optional[list[str]] = None
 
